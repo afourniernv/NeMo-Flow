@@ -266,6 +266,39 @@ fn test_response_text_extracts_first_text_from_parts() {
     assert_eq!(resp.response_text(), Some("Part text"));
 }
 
+#[test]
+fn test_response_text_skips_leading_image_parts() {
+    let resp = AnnotatedLlmResponse {
+        message: Some(MessageContent::Parts(vec![
+            ContentPart::ImageUrl {
+                image_url: super::super::request::OpenAiImageUrl {
+                    url: "https://example.com/a.png".into(),
+                    detail: Some("low".into()),
+                },
+            },
+            ContentPart::Text {
+                text: "Visible text".into(),
+            },
+        ])),
+        ..minimal_response()
+    };
+    assert_eq!(resp.response_text(), Some("Visible text"));
+}
+
+#[test]
+fn test_response_text_returns_none_for_image_only_parts() {
+    let resp = AnnotatedLlmResponse {
+        message: Some(MessageContent::Parts(vec![ContentPart::ImageUrl {
+            image_url: super::super::request::OpenAiImageUrl {
+                url: "https://example.com/a.png".into(),
+                detail: None,
+            },
+        }])),
+        ..minimal_response()
+    };
+    assert_eq!(resp.response_text(), None);
+}
+
 // -------------------------------------------------------------------
 // Helper: has_tool_calls()
 // -------------------------------------------------------------------

@@ -266,6 +266,95 @@ fn test_annotated_llm_request_extra_flatten() {
     assert_eq!(serialized["custom_field"], json!("value"));
 }
 
+#[test]
+fn test_system_prompt_skips_image_parts_and_returns_first_text_part() {
+    let req = AnnotatedLlmRequest {
+        messages: vec![Message::System {
+            content: MessageContent::Parts(vec![
+                ContentPart::ImageUrl {
+                    image_url: OpenAiImageUrl {
+                        url: "https://example.com/a.png".into(),
+                        detail: Some("high".into()),
+                    },
+                },
+                ContentPart::Text {
+                    text: "Be terse".into(),
+                },
+            ]),
+            name: None,
+        }],
+        model: None,
+        params: None,
+        tools: None,
+        tool_choice: None,
+        store: None,
+        previous_response_id: None,
+        truncation: None,
+        reasoning: None,
+        include: None,
+        user: None,
+        metadata: None,
+        service_tier: None,
+        parallel_tool_calls: None,
+        max_output_tokens: None,
+        max_tool_calls: None,
+        top_logprobs: None,
+        stream: None,
+        extra: serde_json::Map::new(),
+    };
+    assert_eq!(req.system_prompt(), Some("Be terse"));
+}
+
+#[test]
+fn test_last_user_message_skips_image_only_parts() {
+    let req = AnnotatedLlmRequest {
+        messages: vec![
+            Message::User {
+                content: MessageContent::Parts(vec![ContentPart::ImageUrl {
+                    image_url: OpenAiImageUrl {
+                        url: "https://example.com/a.png".into(),
+                        detail: None,
+                    },
+                }]),
+                name: None,
+            },
+            Message::User {
+                content: MessageContent::Parts(vec![
+                    ContentPart::ImageUrl {
+                        image_url: OpenAiImageUrl {
+                            url: "https://example.com/b.png".into(),
+                            detail: None,
+                        },
+                    },
+                    ContentPart::Text {
+                        text: "final text".into(),
+                    },
+                ]),
+                name: None,
+            },
+        ],
+        model: None,
+        params: None,
+        tools: None,
+        tool_choice: None,
+        store: None,
+        previous_response_id: None,
+        truncation: None,
+        reasoning: None,
+        include: None,
+        user: None,
+        metadata: None,
+        service_tier: None,
+        parallel_tool_calls: None,
+        max_output_tokens: None,
+        max_tool_calls: None,
+        top_logprobs: None,
+        stream: None,
+        extra: serde_json::Map::new(),
+    };
+    assert_eq!(req.last_user_message(), Some("final text"));
+}
+
 // -------------------------------------------------------------------
 // Clone trait
 // -------------------------------------------------------------------

@@ -5,7 +5,7 @@
 
 use nemo_flow::codec::request::{
     AnnotatedLlmRequest, ContentPart, FunctionCall, FunctionDefinition, Message, MessageContent,
-    ToolCall, ToolDefinition,
+    OpenAiImageUrl, ToolCall, ToolDefinition,
 };
 
 use super::super::ir_builder::build_prompt_ir;
@@ -186,4 +186,83 @@ fn build_prompt_ir_omits_tool_schema_hashes_when_no_tools_are_present() {
     assert_eq!(prompt_ir.blocks.len(), 1);
     assert!(prompt_ir.tool_schema_hashes.is_none());
     assert_eq!(prompt_ir.blocks[0].span_id.0, "user-0");
+}
+
+#[test]
+fn build_prompt_ir_skips_image_parts_when_extracting_text_blocks() {
+    let request = AnnotatedLlmRequest {
+        messages: vec![Message::User {
+            content: MessageContent::Parts(vec![
+                ContentPart::ImageUrl {
+                    image_url: OpenAiImageUrl {
+                        url: "https://example.com/a.png".to_string(),
+                        detail: Some("high".to_string()),
+                    },
+                },
+                ContentPart::Text {
+                    text: "Describe this image".to_string(),
+                },
+            ]),
+            name: None,
+        }],
+        model: Some("gpt-4o".to_string()),
+        params: None,
+        tools: None,
+        tool_choice: None,
+        store: None,
+        previous_response_id: None,
+        truncation: None,
+        reasoning: None,
+        include: None,
+        user: None,
+        metadata: None,
+        service_tier: None,
+        parallel_tool_calls: None,
+        max_output_tokens: None,
+        max_tool_calls: None,
+        top_logprobs: None,
+        stream: None,
+        extra: serde_json::Map::new(),
+    };
+
+    let prompt_ir = build_prompt_ir(&request).unwrap();
+    assert_eq!(prompt_ir.blocks.len(), 1);
+    assert_eq!(prompt_ir.blocks[0].content, "Describe this image");
+}
+
+#[test]
+fn build_prompt_ir_uses_empty_text_for_image_only_content() {
+    let request = AnnotatedLlmRequest {
+        messages: vec![Message::User {
+            content: MessageContent::Parts(vec![ContentPart::ImageUrl {
+                image_url: OpenAiImageUrl {
+                    url: "https://example.com/only-image.png".to_string(),
+                    detail: None,
+                },
+            }]),
+            name: None,
+        }],
+        model: Some("gpt-4o".to_string()),
+        params: None,
+        tools: None,
+        tool_choice: None,
+        store: None,
+        previous_response_id: None,
+        truncation: None,
+        reasoning: None,
+        include: None,
+        user: None,
+        metadata: None,
+        service_tier: None,
+        parallel_tool_calls: None,
+        max_output_tokens: None,
+        max_tool_calls: None,
+        top_logprobs: None,
+        stream: None,
+        extra: serde_json::Map::new(),
+    };
+
+    let prompt_ir = build_prompt_ir(&request).unwrap();
+    assert_eq!(prompt_ir.blocks.len(), 1);
+    assert_eq!(prompt_ir.blocks[0].content, "");
 }
