@@ -7,8 +7,9 @@ mod plugin_host_test_support;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 
 use nemo_relay::api::event::{Event, ScopeCategory};
 use nemo_relay::api::llm::{
@@ -584,7 +585,6 @@ async fn sdk_cdylib_registers_tool_request_intercept() {
         true
     );
     assert!(llm_end.annotated_response().is_none());
-
     events.lock().unwrap().clear();
     let collected_stream_chunks = Arc::new(Mutex::new(Vec::<Json>::new()));
     let collector_chunks = collected_stream_chunks.clone();
@@ -647,6 +647,66 @@ async fn sdk_cdylib_registers_tool_request_intercept() {
     assert_eq!(
         stream_end.output().unwrap()[0]["native_plugin_llm_stream_execution"],
         true
+    );
+
+    events.lock().unwrap().clear();
+    let provider_polled = Arc::new(AtomicBool::new(false));
+    let polled = Arc::clone(&provider_polled);
+    let cancelled_stream = llm_stream_call_execute(
+        LlmStreamCallExecuteParams::builder()
+            .name("native-fixture-cancelled-stream")
+            .request(LlmRequest {
+                headers: Map::new(),
+                content: json!({ "prompt": "cancel" }),
+            })
+            .func(Arc::new(move |_request| {
+                let polled = Arc::clone(&polled);
+                Box::pin(async move {
+                    Ok(LlmJsonStream::new(futures::stream::poll_fn(move |_| {
+                        polled.store(true, Ordering::SeqCst);
+                        Poll::Pending
+                    })))
+                })
+            }))
+            .collector(Box::new(|_| Ok(())))
+            .finalizer(Box::new(|| Json::Null))
+            .build(),
+    )
+    .await
+    .expect("pending native stream should open");
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !provider_polled.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("provider stream should be polled before cancellation");
+    drop(cancelled_stream);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            flush_subscribers().expect("cancelled stream events should flush");
+            if events.lock().unwrap().iter().any(|event| {
+                event.name() == "fixture.native.stream.drop"
+                    && event.scope_category() == Some(ScopeCategory::End)
+            }) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("plugin stream Drop should emit its scope after cancellation");
+    let cancelled_stream_events = events.lock().unwrap().clone();
+    let cancelled_stream_start = find_event(
+        &cancelled_stream_events,
+        "native-fixture-cancelled-stream",
+        Some(ScopeCategory::Start),
+    );
+    assert_parent(
+        &cancelled_stream_events,
+        "fixture.native.stream.drop",
+        Some(ScopeCategory::End),
+        Some(cancelled_stream_start.uuid()),
     );
 
     events.lock().unwrap().clear();

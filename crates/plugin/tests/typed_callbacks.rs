@@ -17,7 +17,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::task::Poll;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use futures::StreamExt;
 use nemo_relay_plugin::{
@@ -424,6 +424,7 @@ static SCOPE_GET_CURRENT_RETURNS_NULL: Mutex<bool> = Mutex::new(false);
 static SCOPE_PUSH_STATUS: Mutex<NemoRelayStatus> = Mutex::new(NemoRelayStatus::Ok);
 static SCOPE_PUSH_RETURNS_NULL: Mutex<bool> = Mutex::new(false);
 static SCOPE_POP_STATUS: Mutex<NemoRelayStatus> = Mutex::new(NemoRelayStatus::Ok);
+static SCOPE_TIMESTAMPS: Mutex<(Option<i64>, Option<i64>)> = Mutex::new((None, None));
 static EMIT_MARK_STATUS: Mutex<NemoRelayStatus> = Mutex::new(NemoRelayStatus::Ok);
 static SCOPE_STACK_CREATE_STATUS: Mutex<NemoRelayStatus> = Mutex::new(NemoRelayStatus::Ok);
 static SCOPE_STACK_CREATE_RETURNS_NULL: Mutex<bool> = Mutex::new(false);
@@ -1406,7 +1407,7 @@ unsafe extern "C" fn capture_scope_push(
     data_json: *const NemoRelayNativeString,
     metadata_json: *const NemoRelayNativeString,
     input_json: *const NemoRelayNativeString,
-    _timestamp_unix_micros: *const i64,
+    timestamp_unix_micros: *const i64,
     out: *mut *mut NemoRelayNativeScopeHandle,
 ) -> NemoRelayStatus {
     if out.is_null() {
@@ -1437,6 +1438,9 @@ unsafe extern "C" fn capture_scope_push(
         "push:{name}:{scope_type:?}:{attributes}:parent={}:data={data}:metadata={metadata}:input={input}",
         !parent.is_null()
     ));
+    if !timestamp_unix_micros.is_null() {
+        SCOPE_TIMESTAMPS.lock().unwrap().0 = Some(unsafe { *timestamp_unix_micros });
+    }
     if *SCOPE_PUSH_RETURNS_NULL.lock().unwrap() {
         unsafe { *out = ptr::null_mut() };
     } else {
@@ -1449,7 +1453,7 @@ unsafe extern "C" fn capture_scope_pop(
     handle: *const NemoRelayNativeScopeHandle,
     output_json: *const NemoRelayNativeString,
     metadata_json: *const NemoRelayNativeString,
-    _timestamp_unix_micros: *const i64,
+    timestamp_unix_micros: *const i64,
 ) -> NemoRelayStatus {
     if handle.is_null() {
         return NemoRelayStatus::NullPointer;
@@ -1471,6 +1475,9 @@ unsafe extern "C" fn capture_scope_pop(
         .lock()
         .unwrap()
         .push(format!("pop:output={output}:metadata={metadata}"));
+    if !timestamp_unix_micros.is_null() {
+        SCOPE_TIMESTAMPS.lock().unwrap().1 = Some(unsafe { *timestamp_unix_micros });
+    }
     NemoRelayStatus::Ok
 }
 
@@ -2930,6 +2937,7 @@ fn reset_state() {
     *SCOPE_PUSH_STATUS.lock().unwrap() = NemoRelayStatus::Ok;
     *SCOPE_PUSH_RETURNS_NULL.lock().unwrap() = false;
     *SCOPE_POP_STATUS.lock().unwrap() = NemoRelayStatus::Ok;
+    *SCOPE_TIMESTAMPS.lock().unwrap() = (None, None);
     *EMIT_MARK_STATUS.lock().unwrap() = NemoRelayStatus::Ok;
     *SCOPE_STACK_CREATE_STATUS.lock().unwrap() = NemoRelayStatus::Ok;
     *SCOPE_STACK_CREATE_RETURNS_NULL.lock().unwrap() = false;
@@ -3291,6 +3299,40 @@ fn plugin_runtime_scope_mark_and_stack_helpers_call_host() {
     assert_eq!(SCOPE_STACK_FREES.load(Ordering::SeqCst), 1);
     assert_eq!(SCOPE_STACK_BINDING_RESTORES.load(Ordering::SeqCst), 1);
     assert_eq!(SCOPE_STACK_BINDING_FREES.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn plugin_runtime_forwards_historical_scope_timestamps() {
+    let _guard = begin_test();
+    let host = test_host();
+    let runtime = PluginRuntime::new(&host);
+    let cases = [
+        (
+            UNIX_EPOCH + Duration::from_micros(1_000_000),
+            UNIX_EPOCH + Duration::from_micros(1_250_000),
+            (Some(1_000_000), Some(1_250_000)),
+        ),
+        (
+            UNIX_EPOCH - Duration::from_micros(1_250_000),
+            UNIX_EPOCH - Duration::from_micros(1_000_000),
+            (Some(-1_250_000), Some(-1_000_000)),
+        ),
+    ];
+
+    for (started_at, ended_at, expected) in cases {
+        let mut scope = runtime
+            .scope_at(
+                "historical",
+                ScopeType::Custom,
+                None,
+                None,
+                None,
+                started_at,
+            )
+            .unwrap();
+        scope.close_at(None, None, ended_at).unwrap();
+        assert_eq!(*SCOPE_TIMESTAMPS.lock().unwrap(), expected);
+    }
 }
 
 #[test]

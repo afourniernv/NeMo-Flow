@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::future::Future;
 use std::marker::PhantomData;
+use std::mem::ManuallyDrop;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
 use std::ptr;
@@ -697,6 +698,20 @@ impl ScopePollBinding {
         let status = unsafe { (self.host.scope_stack_restore_thread)(previous) };
         status_result(status, "restore executor scope stack")
     }
+
+    fn drop_bound<T>(&mut self, value: &mut ManuallyDrop<T>) {
+        let Ok(previous) = self.enter() else {
+            // The value must still be reclaimed if the host cannot install the
+            // captured callback context during teardown.
+            // SAFETY: `value` is initialized once and only dropped here.
+            unsafe { ManuallyDrop::drop(value) };
+            return;
+        };
+        let mut restore = ScopePollRestore::new(self, previous);
+        // SAFETY: `value` is initialized once and only dropped here.
+        unsafe { ManuallyDrop::drop(value) };
+        let _ = restore.restore();
+    }
 }
 
 struct ScopePollRestore<'a> {
@@ -741,13 +756,16 @@ impl Drop for ScopePollBinding {
 }
 
 struct ScopedFuture<F> {
-    future: F,
+    future: ManuallyDrop<F>,
     binding: ScopePollBinding,
 }
 
 impl<F> ScopedFuture<F> {
     fn new(future: F, binding: ScopePollBinding) -> Self {
-        Self { future, binding }
+        Self {
+            future: ManuallyDrop::new(future),
+            binding,
+        }
     }
 }
 
@@ -762,20 +780,29 @@ impl<F: Future> Future for ScopedFuture<F> {
             .enter()
             .unwrap_or_else(|error| panic!("{error}"));
         let mut restore = ScopePollRestore::new(&mut this.binding, previous);
-        let result = unsafe { Pin::new_unchecked(&mut this.future) }.poll(cx);
+        let result = unsafe { Pin::new_unchecked(&mut *this.future) }.poll(cx);
         restore.restore().unwrap_or_else(|error| panic!("{error}"));
         result
     }
 }
 
+impl<F> Drop for ScopedFuture<F> {
+    fn drop(&mut self) {
+        self.binding.drop_bound(&mut self.future);
+    }
+}
+
 struct ScopedStream<S> {
-    stream: S,
+    stream: ManuallyDrop<S>,
     binding: ScopePollBinding,
 }
 
 impl<S> ScopedStream<S> {
     fn new(stream: S, binding: ScopePollBinding) -> Self {
-        Self { stream, binding }
+        Self {
+            stream: ManuallyDrop::new(stream),
+            binding,
+        }
     }
 }
 
@@ -790,9 +817,15 @@ impl<S: Stream> Stream for ScopedStream<S> {
             .enter()
             .unwrap_or_else(|error| panic!("{error}"));
         let mut restore = ScopePollRestore::new(&mut this.binding, previous);
-        let result = unsafe { Pin::new_unchecked(&mut this.stream) }.poll_next(cx);
+        let result = unsafe { Pin::new_unchecked(&mut *this.stream) }.poll_next(cx);
         restore.restore().unwrap_or_else(|error| panic!("{error}"));
         result
+    }
+}
+
+impl<S> Drop for ScopedStream<S> {
+    fn drop(&mut self) {
+        self.binding.drop_bound(&mut self.stream);
     }
 }
 
