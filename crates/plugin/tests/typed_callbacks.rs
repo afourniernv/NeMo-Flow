@@ -3317,6 +3317,11 @@ fn plugin_runtime_forwards_historical_scope_timestamps() {
             UNIX_EPOCH - Duration::from_micros(1_000_000),
             (Some(-1_250_000), Some(-1_000_000)),
         ),
+        (
+            UNIX_EPOCH - Duration::from_nanos(1_500),
+            UNIX_EPOCH - Duration::from_nanos(500),
+            (Some(-2), Some(-1)),
+        ),
     ];
 
     for (started_at, ended_at, expected) in cases {
@@ -3333,6 +3338,93 @@ fn plugin_runtime_forwards_historical_scope_timestamps() {
         scope.close_at(None, None, ended_at).unwrap();
         assert_eq!(*SCOPE_TIMESTAMPS.lock().unwrap(), expected);
     }
+}
+
+#[test]
+fn ordinary_scope_helpers_leave_native_timestamps_unset() {
+    let _guard = begin_test();
+    let host = test_host();
+    let runtime = PluginRuntime::new(&host);
+
+    let mut scope = runtime
+        .scope("current-time", ScopeType::Custom, None, None, None)
+        .unwrap();
+    scope.close(None, None).unwrap();
+
+    assert_eq!(*SCOPE_TIMESTAMPS.lock().unwrap(), (None, None));
+}
+
+#[test]
+fn historical_scope_close_retains_ownership_after_failure_and_is_idempotent() {
+    let _guard = begin_test();
+    let host = test_host();
+    let runtime = PluginRuntime::new(&host);
+    let mut scope = runtime
+        .scope_at(
+            "historical",
+            ScopeType::Custom,
+            None,
+            None,
+            None,
+            UNIX_EPOCH + Duration::from_micros(10),
+        )
+        .unwrap();
+
+    *SCOPE_POP_STATUS.lock().unwrap() = NemoRelayStatus::Internal;
+    assert_eq!(
+        scope
+            .close_at(None, None, UNIX_EPOCH + Duration::from_micros(20))
+            .unwrap_err(),
+        "scope_pop failed: Internal"
+    );
+    assert!(scope.handle().is_some());
+
+    *SCOPE_POP_STATUS.lock().unwrap() = NemoRelayStatus::Ok;
+    scope
+        .close_at(None, None, UNIX_EPOCH + Duration::from_micros(30))
+        .unwrap();
+    assert!(scope.handle().is_none());
+    scope
+        .close_at(None, None, UNIX_EPOCH + Duration::from_micros(40))
+        .unwrap();
+
+    assert_eq!(
+        RUNTIME_CALLS
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call.starts_with("pop:"))
+            .count(),
+        1
+    );
+    assert_eq!(*SCOPE_TIMESTAMPS.lock().unwrap(), (Some(10), Some(30)));
+}
+
+#[test]
+fn historical_scope_rejects_timestamps_outside_native_range() {
+    let _guard = begin_test();
+    let host = test_host();
+    let runtime = PluginRuntime::new(&host);
+    let Some(outside_native_range) =
+        UNIX_EPOCH.checked_add(Duration::from_micros(i64::MAX as u64 + 1))
+    else {
+        // Windows FILETIME cannot represent a SystemTime this far after the
+        // epoch, so the public API cannot receive this overflow case there.
+        return;
+    };
+
+    assert_eq!(
+        expect_string_err(runtime.scope_at(
+            "historical",
+            ScopeType::Custom,
+            None,
+            None,
+            None,
+            outside_native_range,
+        )),
+        "scope timestamp exceeds the supported range"
+    );
+    assert!(RUNTIME_CALLS.lock().unwrap().is_empty());
 }
 
 #[test]

@@ -1791,7 +1791,11 @@ impl PluginRuntime {
         })
     }
 
-    /// Opens a scope immediately and records `started_at` on its start event.
+    /// Opens a scope and records `started_at` on its start event.
+    ///
+    /// This is typed SDK access to the timestamp slot already carried by the
+    /// native host's `scope_push` function. It does not introduce a distinct
+    /// scope event or change the native ABI.
     pub fn scope_at(
         &self,
         name: &str,
@@ -1966,7 +1970,12 @@ impl<'a> ScopeGuard<'a> {
         Ok(())
     }
 
-    /// Pops the scope immediately and records `ended_at` on its end event.
+    /// Pops the scope and records `ended_at` on its end event.
+    ///
+    /// This is typed SDK access to the timestamp slot already carried by the
+    /// native host's `scope_pop` function. The handle remains owned by this
+    /// guard if the host rejects the close, so [`Drop`] can still attempt the
+    /// ordinary cleanup path.
     pub fn close_at(
         &mut self,
         output: Option<&Json>,
@@ -2381,7 +2390,14 @@ fn pop_scope_with_timestamp(
 fn unix_micros(timestamp: SystemTime) -> Result<i64> {
     let micros = match timestamp.duration_since(UNIX_EPOCH) {
         Ok(duration) => i128::try_from(duration.as_micros()),
-        Err(error) => i128::try_from(error.duration().as_micros()).map(|micros| -micros),
+        Err(error) => {
+            let duration = error.duration();
+            i128::try_from(duration.as_micros()).map(|micros| {
+                // `Duration::as_micros` truncates toward zero, but a signed
+                // Unix timestamp must floor pre-epoch sub-microsecond values.
+                -micros - i128::from(duration.subsec_nanos() % 1_000 != 0)
+            })
+        }
     }
     .map_err(|_| "scope timestamp exceeds the supported range".to_string())?;
     i64::try_from(micros).map_err(|_| "scope timestamp exceeds the supported range".to_string())

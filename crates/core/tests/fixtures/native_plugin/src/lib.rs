@@ -26,12 +26,15 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 struct FixtureNativePlugin;
 
-struct StreamDropScope(PluginRuntime);
+struct DropScope {
+    runtime: PluginRuntime,
+    name: &'static str,
+}
 
-impl Drop for StreamDropScope {
+impl Drop for DropScope {
     fn drop(&mut self) {
-        if let Ok(mut scope) = self.0.scope(
-            "fixture.native.stream.drop",
+        if let Ok(mut scope) = self.runtime.scope(
+            self.name,
             ScopeType::Custom,
             None,
             None,
@@ -341,24 +344,35 @@ impl NativePlugin for FixtureNativePlugin {
                 ))
             },
         )?;
-        ctx.register_llm_execution_intercept(
-            "fixture_llm_execution",
-            0,
-            |_name, request, next| async move {
-                let response = next
-                    .call(mark_llm_request(
-                        request,
-                        "native_plugin_llm_execution_request",
-                    ))
-                    .await?;
-                Ok(mark_json(response, "native_plugin_llm_execution"))
-            },
-        )?;
+        ctx.register_llm_execution_intercept("fixture_llm_execution", 0, {
+            let runtime = runtime.clone();
+            move |name, request, next| {
+                let drop_scope = (name == "native-fixture-cancelled-unary").then(|| DropScope {
+                    runtime: runtime.clone(),
+                    name: "fixture.native.unary.drop",
+                });
+                async move {
+                    if let Some(_drop_scope) = drop_scope {
+                        ASYNC_PENDING_ENTERED.store(true, Ordering::Release);
+                        return futures::future::pending::<nemo_relay_plugin::Result<Json>>().await;
+                    }
+                    let response = next
+                        .call(mark_llm_request(
+                            request,
+                            "native_plugin_llm_execution_request",
+                        ))
+                        .await?;
+                    Ok(mark_json(response, "native_plugin_llm_execution"))
+                }
+            }
+        })?;
         ctx.register_llm_stream_execution_intercept("fixture_llm_stream_execution", 0, {
             let runtime = runtime.clone();
             move |name, request, next| {
-                let drop_scope = (name == "native-fixture-cancelled-stream")
-                    .then(|| StreamDropScope(runtime.clone()));
+                let drop_scope = (name == "native-fixture-cancelled-stream").then(|| DropScope {
+                    runtime: runtime.clone(),
+                    name: "fixture.native.stream.drop",
+                });
                 async move {
                     let stream = next
                         .call(mark_llm_request(

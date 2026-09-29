@@ -218,6 +218,15 @@ async fn sdk_cdylib_registers_tool_request_intercept() {
         manifest_ref: manifest_ref.to_string_lossy().into_owned(),
     }])
     .expect("native plugin should load");
+    let fixture_library = unsafe { libloading::Library::new(&fixture.library_path) }
+        .expect("native fixture should open for synchronization");
+    let pending_entered = unsafe {
+        *fixture_library
+            .get::<unsafe extern "C" fn() -> bool>(b"nemo_relay_fixture_async_pending_entered\0")
+            .expect("native fixture should export its pending-entry signal")
+    };
+    // Clear a signal left by any earlier fixture use in this process.
+    let _ = unsafe { pending_entered() };
     let mut cleanup = NativePluginTestCleanup::new();
 
     let mut plugin_config = PluginConfig::default();
@@ -585,6 +594,60 @@ async fn sdk_cdylib_registers_tool_request_intercept() {
         true
     );
     assert!(llm_end.annotated_response().is_none());
+
+    events.lock().unwrap().clear();
+    let cancelled_unary = tokio::spawn(llm_call_execute(
+        LlmCallExecuteParams::builder()
+            .name("native-fixture-cancelled-unary")
+            .request(LlmRequest {
+                headers: Map::new(),
+                content: json!({ "prompt": "cancel" }),
+            })
+            .func(Arc::new(|_| Box::pin(std::future::pending())))
+            .build(),
+    ));
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !unsafe { pending_entered() } {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("native unary future should start before cancellation");
+    cancelled_unary.abort();
+    assert!(
+        cancelled_unary
+            .await
+            .expect_err("pending native unary call should be cancelled")
+            .is_cancelled()
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            flush_subscribers().expect("cancelled unary events should flush");
+            if events.lock().unwrap().iter().any(|event| {
+                event.name() == "fixture.native.unary.drop"
+                    && event.scope_category() == Some(ScopeCategory::End)
+            }) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("plugin unary future Drop should emit its scope after cancellation");
+    let cancelled_unary_events = events.lock().unwrap().clone();
+    let cancelled_unary_start = find_event(
+        &cancelled_unary_events,
+        "native-fixture-cancelled-unary",
+        Some(ScopeCategory::Start),
+    );
+    assert_parent(
+        &cancelled_unary_events,
+        "fixture.native.unary.drop",
+        Some(ScopeCategory::End),
+        Some(cancelled_unary_start.uuid()),
+    );
+    drop(fixture_library);
+
     events.lock().unwrap().clear();
     let collected_stream_chunks = Arc::new(Mutex::new(Vec::<Json>::new()));
     let collector_chunks = collected_stream_chunks.clone();

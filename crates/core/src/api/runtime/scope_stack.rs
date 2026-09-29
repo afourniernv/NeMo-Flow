@@ -554,8 +554,9 @@ struct ActiveEventBinding {
 
 /// Captured thread-local scope stack binding.
 ///
-/// This preserves both the visible scope stack handle and whether it was
-/// explicitly installed on the current thread.
+/// This preserves the visible scope stack handle, whether it was explicitly
+/// installed on the current thread, and any managed event bound at capture
+/// time.
 #[derive(Clone)]
 pub struct ThreadScopeStackBinding {
     stack: ScopeStackHandle,
