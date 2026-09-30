@@ -2023,11 +2023,16 @@ impl WorkerPluginCallback {
         );
         let mut client = self.client.clone();
         let mut guard = WorkerInvocationGuard::new(self, &invoke);
+        let has_continuation = !invoke.continuation_id.is_empty();
         let (tx, rx) = mpsc::channel(16);
         let (next_ready_tx, next_ready_rx) = oneshot::channel();
         self.runtime.spawn(async move {
             let result = tokio::select! {
-                result = worker_rpc(client.invoke_stream(worker_rpc_request(invoke))) => result,
+                result = worker_callback_rpc(
+                    has_continuation,
+                    WORKER_RPC_TIMEOUT,
+                    client.invoke_stream(worker_rpc_request(invoke)),
+                ) => result,
                 _ = tx.closed() => {
                     guard.cancel("host stopped consuming the worker stream");
                     guard.finish();
@@ -2147,11 +2152,17 @@ impl WorkerPluginCallback {
     ) -> FlowResult<InvokeResponse> {
         let mut guard = WorkerInvocationGuard::new(self, &request);
         let mut client = self.client.clone();
-        let result =
-            worker_rpc_with_timeout(timeout, client.invoke(worker_rpc_request(request))).await;
-        if result
-            .as_ref()
-            .is_err_and(|err| err.code() == tonic::Code::DeadlineExceeded)
+        let has_continuation = !request.continuation_id.is_empty();
+        let result = worker_callback_rpc(
+            has_continuation,
+            timeout,
+            client.invoke(worker_rpc_request(request)),
+        )
+        .await;
+        if !has_continuation
+            && result
+                .as_ref()
+                .is_err_and(|err| err.code() == tonic::Code::DeadlineExceeded)
         {
             guard.cancel("worker invocation timed out");
         }
@@ -2258,6 +2269,23 @@ where
     F: Future<Output = Result<Response<T>, Status>>,
 {
     worker_rpc_with_timeout(WORKER_RPC_TIMEOUT, future).await
+}
+
+async fn worker_callback_rpc<T, F>(
+    has_continuation: bool,
+    timeout: Duration,
+    future: F,
+) -> Result<Response<T>, Status>
+where
+    F: Future<Output = Result<Response<T>, Status>>,
+{
+    if has_continuation {
+        // The caller owns execution-intercept lifetime through cancellation;
+        // a downstream tool or provider may legitimately exceed this timeout.
+        future.await
+    } else {
+        worker_rpc_with_timeout(timeout, future).await
+    }
 }
 
 async fn worker_rpc_with_timeout<T, F>(timeout: Duration, future: F) -> Result<Response<T>, Status>

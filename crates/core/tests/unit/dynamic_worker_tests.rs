@@ -1414,6 +1414,76 @@ async fn callback_timeout_sends_explicit_worker_cancellation() {
     assert!(cancellation.reason.contains("timed out"));
 }
 
+#[tokio::test(start_paused = true)]
+async fn execution_callback_can_outlive_worker_rpc_timeout() {
+    enable_operational_logs();
+    let (started_tx, started_rx) = oneshot::channel();
+    let started_tx = Arc::new(Mutex::new(Some(started_tx)));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (callback, _shutdown, mut cancel_rx) = fake_callback_service_with_handlers(
+        {
+            let started_tx = Arc::clone(&started_tx);
+            let release = Arc::clone(&release);
+            move |_| {
+                let started_tx = Arc::clone(&started_tx);
+                let release = Arc::clone(&release);
+                Box::pin(async move {
+                    if let Some(started) = started_tx.lock().expect("started lock").take() {
+                        let _ = started.send(());
+                    }
+                    release.notified().await;
+                    InvokeResponse {
+                        result: Some(InvokeResult::Empty(EmptyResult {})),
+                    }
+                })
+            }
+        },
+        |_| Box::pin(tokio_stream::empty()),
+    )
+    .await;
+
+    let continuation_id = callback
+        .host_state
+        .insert_continuation(Continuation::llm(Arc::new(|request| {
+            Box::pin(async move { Ok(request.content) })
+        })))
+        .expect("continuation should insert");
+    let request = callback.base_request(
+        "slow-execution",
+        RegistrationSurface::LlmExecutionIntercept,
+        Some(continuation_id),
+        Some(invoke_request_payload_llm(
+            "model",
+            Some(valid_llm_request()),
+            None,
+            None,
+        )),
+    );
+    let callback_task = callback.clone();
+    let task = tokio::spawn(async move {
+        callback_task
+            .invoke_async_with_timeout(request, std::time::Duration::from_millis(10))
+            .await
+    });
+    started_rx
+        .await
+        .expect("worker execution should start before time advances");
+    tokio::time::advance(std::time::Duration::from_millis(11)).await;
+    tokio::task::yield_now().await;
+
+    assert!(!task.is_finished());
+    assert!(matches!(
+        cancel_rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    release.notify_one();
+    task.await
+        .expect("worker execution task should join")
+        .expect("worker execution should complete");
+    assert!(callback.host_state.continuations.lock().unwrap().is_empty());
+    assert!(callback.host_state.scope_stacks.lock().unwrap().is_empty());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn dropping_callback_future_cancels_worker_and_cleans_host_state() {
     enable_operational_logs();
